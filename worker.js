@@ -1,0 +1,453 @@
+// worker.js - Deploy this on Railway, Render, Heroku, or any long-running platform
+const express = require('express');
+const Anthropic = require('@anthropic-ai/sdk');
+const axios = require('axios');
+
+const app = express();
+app.use(express.json({ limit: '10mb' }));
+
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+const anthropic = new Anthropic({
+  apiKey: ANTHROPIC_API_KEY,
+  baseURL: 'https://aipipe.iitm.ac.in/anthropic/v1'
+});
+
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function decodeDataURI(dataUri) {
+  const matches = dataUri.match(/^data:([^;]+);base64,(.+)$/);
+  if (!matches) return null;
+  
+  const mimeType = matches[1];
+  const base64Data = matches[2];
+  const content = Buffer.from(base64Data, 'base64').toString('utf-8');
+  
+  return { mimeType, content };
+}
+
+async function generateCode(brief, checks, attachments) {
+  let attachmentDetails = '';
+  
+  if (attachments && attachments.length > 0) {
+    attachmentDetails = '\n\nATTACHMENTS:\n';
+    
+    for (const att of attachments) {
+      if (att.url.startsWith('data:')) {
+        const decoded = decodeDataURI(att.url);
+        if (decoded) {
+          attachmentDetails += `\nFile: ${att.name}\nMIME Type: ${decoded.mimeType}\nContent:\n${decoded.content}\n---\n`;
+        }
+      }
+    }
+  }
+
+  const prompt = `You are an expert web developer. Create a COMPLETE, WORKING single HTML file that MUST pass ALL validation checks.
+
+TASK BRIEF:
+${brief}
+
+VALIDATION CHECKS (CRITICAL - your code MUST pass ALL of these):
+${checks.map((c, i) => `CHECK ${i + 1}: ${c}`).join('\n')}
+
+${attachmentDetails}
+
+CRITICAL IMPLEMENTATION REQUIREMENTS:
+
+1. HTML STRUCTURE:
+   - Complete HTML5 document with proper <!DOCTYPE html>
+   - All CSS in <style> tags inside <head>
+   - All JavaScript in <script> tags before </body>
+   - Use exact element IDs as specified in checks (e.g., #total-sales, #product-sales, #github-user-2025)
+
+2. BOOTSTRAP LOADING (if required):
+   - Load Bootstrap 5 CSS from: https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css
+   - Load Bootstrap 5 JS from: https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js
+   - Ensure the link tag is in <head>
+
+3. CSV/DATA HANDLING:
+   - If CSV data is provided, embed it directly in the HTML as a JavaScript string
+   - Parse CSV manually (split by newlines and commas) or use Papa Parse: https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js
+   - For CSV with 'sales' column: parse rows, skip header, convert to numbers with parseFloat(), sum correctly
+   - Handle headers properly
+
+4. CALCULATIONS:
+   - Use parseFloat() for numeric conversions
+   - Ensure precision to 2 decimal places with .toFixed(2) where needed
+   - Set textContent (not innerHTML) for numeric values
+
+5. ELEMENT REQUIREMENTS:
+   - Set document.title exactly as specified in checks
+   - Create all required elements with exact IDs from checks
+   - Bootstrap tables should use classes: table, table-bordered, table-striped
+
+6. JAVASCRIPT EXECUTION:
+   - Wrap all code in DOMContentLoaded event listener
+   - Test that all querySelector() calls will succeed
+   - Ensure calculations are accurate to pass Math.abs() checks
+
+7. EXTERNAL APIs (if needed):
+   - For GitHub API: use fetch() to https://api.github.com/users/{username}
+   - For Markdown: use marked.js from CDN: https://cdn.jsdelivr.net/npm/marked@11.0.0/marked.min.js
+   - For syntax highlighting: use highlight.js from CDN
+
+EXAMPLE FOR CSV SUM TASK:
+\`\`\`javascript
+document.addEventListener('DOMContentLoaded', function() {
+  const csvData = \`product,sales
+Apple,500
+Banana,400
+Cherry,600\`;
+  
+  const lines = csvData.trim().split('\\n');
+  const headers = lines[0].split(',');
+  const salesIndex = headers.indexOf('sales');
+  
+  let total = 0;
+  for (let i = 1; i < lines.length; i++) {
+    const values = lines[i].split(',');
+    total += parseFloat(values[salesIndex]);
+  }
+  
+  document.querySelector('#total-sales').textContent = total.toFixed(2);
+});
+\`\`\`
+
+OUTPUT:
+Provide ONLY the complete HTML code. No markdown code blocks, no explanations, just raw HTML starting with <!DOCTYPE html>.`;
+
+  const message = await anthropic.messages.create({
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 8000,
+    messages: [{
+      role: 'user',
+      content: prompt
+    }]
+  });
+
+  let code = message.content[0].text;
+  code = code.replace(/```html\n?/g, '').replace(/```\n?/g, '').trim();
+  
+  if (!code.startsWith('<!DOCTYPE') && !code.startsWith('<!doctype')) {
+    code = '<!DOCTYPE html>\n' + code;
+  }
+  
+  return code;
+}
+
+async function createGitHubRepo(repoName) {
+  try {
+    const response = await axios.post(
+      'https://api.github.com/user/repos',
+      {
+        name: repoName,
+        description: 'Auto-generated by LLM deployment system',
+        public: true,
+        auto_init: false
+      },
+      {
+        headers: {
+          'Authorization': `token ${GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'LLM-Deployment-Bot'
+        }
+      }
+    );
+    console.log(`✓ Created repo: ${repoName}`);
+    return response.data;
+  } catch (error) {
+    if (error.response?.status === 422) {
+      console.log(`✓ Repo ${repoName} already exists`);
+      return { name: repoName };
+    }
+    throw error;
+  }
+}
+
+async function pushFileToGitHub(repoName, filePath, content, message) {
+  const url = `https://api.github.com/repos/${GITHUB_USERNAME}/${repoName}/contents/${filePath}`;
+  
+  await axios.put(
+    url,
+    {
+      message: message,
+      content: Buffer.from(content).toString('base64')
+    },
+    {
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'LLM-Deployment-Bot'
+      }
+    }
+  );
+  console.log(`✓ Pushed: ${filePath}`);
+}
+
+async function updateFileOnGitHub(repoName, filePath, content, message) {
+  const url = `https://api.github.com/repos/${GITHUB_USERNAME}/${repoName}/contents/${filePath}`;
+  
+  const currentFile = await axios.get(url, {
+    headers: {
+      'Authorization': `token ${GITHUB_TOKEN}`,
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'LLM-Deployment-Bot'
+    }
+  });
+  
+  await axios.put(
+    url,
+    {
+      message: message,
+      content: Buffer.from(content).toString('base64'),
+      sha: currentFile.data.sha
+    },
+    {
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'LLM-Deployment-Bot'
+      }
+    }
+  );
+  console.log(`✓ Updated: ${filePath}`);
+}
+
+async function enableGitHubPages(repoName) {
+  try {
+    await axios.post(
+      `https://api.github.com/repos/${GITHUB_USERNAME}/${repoName}/pages`,
+      {
+        source: {
+          branch: 'main',
+          path: '/'
+        }
+      },
+      {
+        headers: {
+          'Authorization': `token ${GITHUB_TOKEN}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'LLM-Deployment-Bot'
+        }
+      }
+    );
+    console.log('✓ GitHub Pages enabled');
+  } catch (error) {
+    if (error.response?.status === 409) {
+      console.log('✓ GitHub Pages already enabled');
+    } else {
+      throw error;
+    }
+  }
+}
+
+async function getLatestCommitSHA(repoName) {
+  const response = await axios.get(
+    `https://api.github.com/repos/${GITHUB_USERNAME}/${repoName}/commits/main`,
+    {
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'User-Agent': 'LLM-Deployment-Bot'
+      }
+    }
+  );
+  return response.data.sha;
+}
+
+async function notifyEvaluationURL(evaluationUrl, payload) {
+  const maxRetries = 5;
+  const retryDelays = [1000, 2000, 4000, 8000, 16000];
+  
+  console.log('📤 Notifying evaluation URL...');
+  
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await axios.post(evaluationUrl, payload, {
+        headers: { 
+          'Content-Type': 'application/json',
+          'User-Agent': 'LLM-Deployment-Bot'
+        },
+        timeout: 30000
+      });
+      
+      if (response.status === 200) {
+        console.log('✓ Successfully notified evaluation URL');
+        return { success: true, response: response.data };
+      }
+    } catch (error) {
+      console.error(`✗ Notification attempt ${i + 1}/${maxRetries} failed`);
+      
+      if (i < maxRetries - 1) {
+        await delay(retryDelays[i]);
+      }
+    }
+  }
+  throw new Error('All notification attempts failed');
+}
+
+function generateREADME(brief, repoName) {
+  return `# ${repoName}
+
+## Project Summary
+${brief}
+
+## Live Demo
+🚀 **Live Site:** https://${GITHUB_USERNAME}.github.io/${repoName}/
+
+## About
+This project was automatically generated and deployed using an LLM-powered deployment system.
+
+## Technical Stack
+- HTML5, CSS3, JavaScript
+- Bootstrap 5
+- GitHub Pages hosting
+
+## License
+MIT License - see LICENSE file for details.
+
+---
+*Generated on ${new Date().toISOString()}*
+`;
+}
+
+const MIT_LICENSE = `MIT License
+
+Copyright (c) 2025
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.`;
+
+// Worker endpoint
+app.post('/process', async (req, res) => {
+  const { email, task, round, nonce, brief, checks, evaluation_url, attachments = [] } = req.body;
+
+  // Return immediately
+  res.status(200).json({ 
+    success: true, 
+    message: 'Processing started',
+    task: task,
+    round: round
+  });
+
+  // Process in background
+  (async () => {
+    try {
+      const repoName = task.toLowerCase().replace(/[^a-z0-9-]/g, '-');
+      
+      console.log(`\n${'='.repeat(60)}`);
+      console.log(`🚀 Starting Round ${round} for: ${task}`);
+      console.log('='.repeat(60));
+      
+      if (round === 1) {
+        console.log('\n📝 Generating code...');
+        const htmlCode = await generateCode(brief, checks || [], attachments);
+        console.log(`✓ Generated ${htmlCode.length} characters`);
+        
+        console.log('\n📦 Creating repository...');
+        await createGitHubRepo(repoName);
+        await delay(2000);
+        
+        console.log('\n📄 Pushing files...');
+        await pushFileToGitHub(repoName, 'LICENSE', MIT_LICENSE, 'Add MIT License');
+        await delay(1000);
+        
+        const readme = generateREADME(brief, repoName);
+        await pushFileToGitHub(repoName, 'README.md', readme, 'Add README');
+        await delay(1000);
+        
+        await pushFileToGitHub(repoName, 'index.html', htmlCode, 'Add main application');
+        await delay(3000);
+        
+        console.log('\n🌐 Enabling GitHub Pages...');
+        await enableGitHubPages(repoName);
+        await delay(5000);
+        
+        console.log('\n🔍 Getting commit SHA...');
+        const commitSha = await getLatestCommitSHA(repoName);
+        
+        console.log('\n📤 Notifying evaluation URL...');
+        const payload = {
+          email: email,
+          task: task,
+          round: round,
+          nonce: nonce,
+          repo_url: `https://github.com/${GITHUB_USERNAME}/${repoName}`,
+          commit_sha: commitSha,
+          pages_url: `https://${GITHUB_USERNAME}.github.io/${repoName}/`
+        };
+        
+        await notifyEvaluationURL(evaluation_url, payload);
+        
+        console.log('\n✅ ROUND 1 COMPLETED');
+        console.log(`Repo: https://github.com/${GITHUB_USERNAME}/${repoName}`);
+        console.log(`Live: https://${GITHUB_USERNAME}.github.io/${repoName}/\n`);
+        
+      } else if (round === 2) {
+        console.log('\n📝 Generating updated code...');
+        const htmlCode = await generateCode(brief, checks || [], attachments);
+        
+        console.log('\n📄 Updating files...');
+        await updateFileOnGitHub(repoName, 'index.html', htmlCode, 'Round 2: Update application');
+        await delay(1000);
+        
+        const readme = generateREADME(brief, repoName);
+        await updateFileOnGitHub(repoName, 'README.md', readme, 'Update README for Round 2');
+        await delay(5000);
+        
+        console.log('\n🔍 Getting commit SHA...');
+        const commitSha = await getLatestCommitSHA(repoName);
+        
+        console.log('\n📤 Notifying evaluation URL...');
+        const payload = {
+          email: email,
+          task: task,
+          round: round,
+          nonce: nonce,
+          repo_url: `https://github.com/${GITHUB_USERNAME}/${repoName}`,
+          commit_sha: commitSha,
+          pages_url: `https://${GITHUB_USERNAME}.github.io/${repoName}/`
+        };
+        
+        await notifyEvaluationURL(evaluation_url, payload);
+        
+        console.log('\n✅ ROUND 2 COMPLETED');
+        console.log(`Repo: https://github.com/${GITHUB_USERNAME}/${repoName}\n`);
+      }
+      
+    } catch (error) {
+      console.error('\n❌ ERROR:', error.message);
+      console.error(error.stack);
+    }
+  })();
+});
+
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'operational',
+    service: 'LLM Deployment Worker',
+    timestamp: new Date().toISOString()
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Worker service running on port ${PORT}`);
+});
